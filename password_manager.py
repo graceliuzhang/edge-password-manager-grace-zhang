@@ -1,6 +1,6 @@
 """Simple password manager (stub).
 
-This module provides placeholder functions for a command‑line password
+This module provides placeholder functions for a command-line password
 manager.  Eventually it will allow users to register with a master
 password, store encrypted passwords for various sites and retrieve them.
 For now, it contains stubs that raise `NotImplementedError` and prints
@@ -35,11 +35,46 @@ from datetime import datetime
 import uuid
 from shutil import copyfile
 
+# === Integrity & Versioning ===
 VERSION = 1
+CHECKSUM_FILE = PASSWORDS_FILE.with_suffix(".sha256")
+WRITE_BLOCKED = False  # flipped to True if integrity check fails at startup
+
+# === Optional encryption (Track-specific security) ===
+# - Derive a key from the master password using PBKDF2 (salt per user).
+# - Encrypt passwords at rest with Fernet.
+import base64
+try:
+    from cryptography.fernet import Fernet
+    from hashlib import pbkdf2_hmac
+    CRYPTO_AVAILABLE = True
+except Exception:
+    # If cryptography isn't installed, we still run, but store plaintext.
+    CRYPTO_AVAILABLE = False
+FernetCipher = None  # set after successful login
 
 
 def _now_iso():
     return datetime.now().isoformat() + "Z"
+
+
+def _checksum(path: Path) -> str:
+    if not path.exists():
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read())
+    return h.hexdigest()
+
+
+def _validate_nonempty(value: str, field: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError(f"{field} cannot be empty.")
+    # basic unsafe character blocking for this CLI context
+    if any(c in value for c in ["\n", "\r", "{", "}", "\x00"]):
+        raise ValueError(f"{field} contains invalid characters.")
+    return value
 
 
 def _safe_save(data: dict | list, path: Path):
@@ -47,11 +82,20 @@ def _safe_save(data: dict | list, path: Path):
 
     - If a previous file exists, make a copy with the .bak extension.
     - Write to a temporary file and then replace the original.
+    - Update checksum file atomically.
     """
+    global WRITE_BLOCKED
+    if WRITE_BLOCKED:
+        print("Refusing to write: integrity check failed. Use Import/Export to recover or recompute checksum.")
+        return
+
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Timestamped backup for extra safety (keeps last state)
+    ts_backup = path.with_suffix(f".{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
     if path.exists():
         try:
             copyfile(path, path.with_suffix(".bak"))
+            copyfile(path, ts_backup)
         except Exception as e:
             # Backup failure shouldn't stop saving; just warn.
             print(f"Warning: couldn't back up {path}: {e}")
@@ -61,10 +105,54 @@ def _safe_save(data: dict | list, path: Path):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
         os.replace(tmp, path)
+        # update checksum
+        CHECKSUM_FILE.write_text(_checksum(path), encoding="utf-8")
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
 
+
+def _verify_integrity_on_startup():
+    """Verify checksum and set WRITE_BLOCKED if mismatch. Never crash."""
+    global WRITE_BLOCKED
+    try:
+        saved = CHECKSUM_FILE.read_text(encoding="utf-8") if CHECKSUM_FILE.exists() else ""
+        current = _checksum(PASSWORDS_FILE)
+        if saved and current and saved != current:
+            print("⚠ Integrity check FAILED — data may have been modified.")
+            print("Writes are blocked to prevent accidental overwrite.")
+            WRITE_BLOCKED = True
+    except Exception:
+        # If anything goes wrong, do not crash; just proceed read-only.
+        WRITE_BLOCKED = True
+        print("⚠ Integrity check could not be completed; proceeding read-only.")
+
+
+def _encrypt_if_possible(plaintext: str) -> str:
+    if CRYPTO_AVAILABLE and FernetCipher:
+        try:
+            return FernetCipher.encrypt(plaintext.encode()).decode()
+        except Exception:
+            pass
+    return plaintext  # fallback to plaintext if crypto not available
+
+
+def _maybe_decrypt(value: str) -> str:
+    """Decrypt Fernet tokens; otherwise return as-is (supports legacy plaintext)."""
+    if not isinstance(value, str):
+        return ""
+    if CRYPTO_AVAILABLE and FernetCipher and value.startswith("gAAAA"):
+        try:
+            return FernetCipher.decrypt(value.encode()).decode()
+        except Exception:
+            # Wrong key or corrupt token; show masked but indicate issue.
+            return "[UNREADABLE]"
+    return value
+
+
+def _derive_key(master_password: str, salt: bytes) -> bytes:
+    raw = pbkdf2_hmac("sha256", master_password.encode(), salt, 200_000)
+    return base64.urlsafe_b64encode(raw)
 
 
 def register_user(username: str, master_password: str) -> None:
@@ -77,12 +165,29 @@ def register_user(username: str, master_password: str) -> None:
         username: The username for the account.
         master_password: The master password to use.
     """
+    try:
+        username = _validate_nonempty(username, "Username")
+        master_password = _validate_nonempty(master_password, "Master password")
+    except ValueError as e:
+        print(f"Input error: {e}")
+        return
+
     hashed_pw = hashlib.sha256(master_password.encode()).hexdigest()
     # Load existing users safely (handles missing/empty file)
     users = _load_json(USER_DATA_FILE, {})
 
-    # save or update user
-    users[username] = hashed_pw
+    # For encryption: store per-user salt (without storing key).
+    # Backward-compatible: if existing value is a string, keep it; else use dict.
+    if username in users and isinstance(users[username], dict):
+        user_rec = users[username]
+    else:
+        user_rec = {}
+
+    user_rec["hash"] = hashed_pw
+    if CRYPTO_AVAILABLE:
+        user_rec["salt"] = base64.b64encode(os.urandom(16)).decode()
+
+    users[username] = user_rec
 
     USER_DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(USER_DATA_FILE, "w") as f:
@@ -100,8 +205,14 @@ def add_password(site: str, username: str, password: str, notes: str = "", tags:
         username: The account username for the site.
         password: The password to store.
     """
-    # Store a password for a given site.
-    entry = {"site": site, "username": username, "password": password}
+    # Validate inputs (reject empty/malformed)
+    try:
+        site = _validate_nonempty(site, "Site")
+        username = _validate_nonempty(username, "Username")
+        password = _validate_nonempty(password, "Password")
+    except ValueError as e:
+        print(f"Input error: {e}")
+        return
 
     # Load existing entries safely (handles missing/empty file)
     passwords = _load_json(PASSWORDS_FILE, {"version": VERSION, "entries": []})
@@ -111,17 +222,17 @@ def add_password(site: str, username: str, password: str, notes: str = "", tags:
 
     # check for duplicates
     for entry in passwords["entries"]:
-        if entry["site"] == site and entry["username"] == username:
+        if entry.get("site") == site and entry.get("username") == username:
             print("Duplicate found for (site, username).")
-            choice = input("Skip (s), Overwrite (o), or Keep both (k)? ").lower()
+            choice = input("Skip (s), Overwrite (o), or Keep both (k)? ").lower().strip()
             if choice == "s":
                 print("Skipped adding.")
                 return
             elif choice == "o":
                 entry.update({
-                    "password": password,
-                    "notes": notes,
-                    "tags": tags or [],
+                    "password": _encrypt_if_possible(password),
+                    "notes": notes or "",
+                    "tags": (tags or []),
                     "last_updated": _now_iso()
                 })
                 print("Overwritten existing entry.")
@@ -144,8 +255,8 @@ def add_password(site: str, username: str, password: str, notes: str = "", tags:
         "id": next_id,
         "site": site,
         "username": username,
-        "password": password,
-        "notes": notes,
+        "password": _encrypt_if_possible(password),
+        "notes": notes or "",
         "tags": tags or [],
         "last_updated": _now_iso()
     }
@@ -192,9 +303,9 @@ def list_password() -> None:
         return
     reveal = input("Reveal passwords? (y/N): ").lower() == "y"
     for p in passwords:
-        # Use dictionary keys directly: p['password'] (do NOT convert 'password' to a number)
-        pw_value = p.get('password', '')
-        pw = pw_value if reveal else '*' * len(pw_value)
+        # decrypt if needed (supports plaintext for backward-compat)
+        pw_value = _maybe_decrypt(p.get('password', ''))
+        pw = pw_value if reveal else '*' * len(pw_value if isinstance(pw_value, str) else "")
         print(f"Site: {p.get('site','?')}, Username: {p.get('username','?')}, Password: {pw}, ID: {p.get('id','?')}")
 
 
@@ -206,13 +317,16 @@ def search_sites(site_name: str) -> list[dict]:
     matches: list[dict] = []
     for entry in passwords:
         saved_site = str(entry.get("site", "")).lower()
-        search_site = site_name.lower()
+        search_site = (site_name or "").lower().strip()
         if saved_site == search_site:
             matches.append(entry)
 
     if matches:
         for entry in matches:
-            print(f"Site: {entry.get('site','?')}, Username: {entry.get('username','?')}, Password: {entry.get('password','')}")
+            # masked by default in search
+            plain = _maybe_decrypt(entry.get('password',''))
+            masked = '*' * len(plain if isinstance(plain, str) else "")
+            print(f"Site: {entry.get('site','?')}, Username: {entry.get('username','?')}, Password: {masked}")
     else:
         print(f"No results found for {site_name}")
     return matches
@@ -235,11 +349,10 @@ def reveal_password(entry_id: str) -> None:
 
     for e in entries:
         if str(e.get("id")) == str(entry_id):
-            print(f"Site: {e.get('site','?')}, Username: {e.get('username','?')}, Password: {e.get('password','')}, ID: {e.get('id', '')}")
+            plain = _maybe_decrypt(e.get('password',''))
+            print(f"Site: {e.get('site','?')}, Username: {e.get('username','?')}, Password: {plain}, ID: {e.get('id', '')}")
             return
     print("No entry found with that ID.")
-
-
 
 
 def login_user(username: str, master_password: str) -> bool:
@@ -254,6 +367,7 @@ def login_user(username: str, master_password: str) -> bool:
     Returns:
         True if login is successful, False otherwise.
     """
+    global FernetCipher
     # Check if user data file exists
     users = _load_json(USER_DATA_FILE, {})
     if not users:
@@ -262,9 +376,24 @@ def login_user(username: str, master_password: str) -> bool:
     if username not in users:
         print("Username not found!")
         return False
+
+    # Backward-compatible: users[username] can be string (old) or dict (new)
+    rec = users.get(username)
+    if isinstance(rec, dict):
+        stored_hash = rec.get("hash")
+    else:
+        stored_hash = rec
+
     entered_hash = hashlib.sha256(master_password.encode()).hexdigest()
-    stored_hash = users.get(username)
     if entered_hash == stored_hash:
+        # Set Fernet cipher for this session (if available)
+        if CRYPTO_AVAILABLE:
+            try:
+                salt_b = base64.b64decode(rec.get("salt")) if isinstance(rec, dict) and rec.get("salt") else os.urandom(16)
+                key = _derive_key(master_password, salt_b)
+                FernetCipher = Fernet(key)
+            except Exception:
+                FernetCipher = None
         print("Success!")
         return True
     else:
@@ -279,14 +408,22 @@ def edit_password(entry_id: str) -> None:
             print("Leave blank to keep current value.")
             new_site = input(f"Site [{e['site']}]: ") or e['site']
             new_user = input(f"Username [{e['username']}]: ") or e['username']
-            new_pw = input("Password (leave blank to keep): ") or e['password']
+            new_pw = input("Password (leave blank to keep): ") or _maybe_decrypt(e['password'])
             new_notes = input(f"Notes [{e.get('notes','')}]: ") or e.get('notes','')
             new_tags = input(f"Tags (comma, blank to keep): ")
             tags = [t.strip() for t in new_tags.split(",")] if new_tags else e.get("tags", [])
+            # validate new values
+            try:
+                new_site = _validate_nonempty(new_site, "Site")
+                new_user = _validate_nonempty(new_user, "Username")
+                new_pw = _validate_nonempty(new_pw, "Password")
+            except ValueError as ve:
+                print(f"Input error: {ve}")
+                return
             e.update({
                 "site": new_site,
                 "username": new_user,
-                "password": new_pw,
+                "password": _encrypt_if_possible(new_pw),
                 "notes": new_notes,
                 "tags": tags,
                 "last_updated": _now_iso()
@@ -299,6 +436,11 @@ def edit_password(entry_id: str) -> None:
 
 def delete_password(entry_id: str) -> None:
     data = _load_json(PASSWORDS_FILE, {"entries": []})
+    # confirmation
+    confirm = input(f"Delete entry {entry_id}? This cannot be undone. (y/N): ").lower().strip()
+    if confirm != "y":
+        print("Delete cancelled.")
+        return
     before = len(data["entries"])
     data["entries"] = [e for e in data["entries"] if str(e.get("id")) != str(entry_id)]
     if len(data["entries"]) < before:
@@ -309,22 +451,35 @@ def delete_password(entry_id: str) -> None:
 
 
 def export_passwords(path: str) -> None:
+    # Export the whole structure as-is (preserves encryption if present)
     data = _load_json(PASSWORDS_FILE, {"version": VERSION, "entries": []})
     with open(path, "w") as f:
         json.dump(data, f, indent=4)
     print(f"Exported to {path}")
 
+
 def import_passwords(path: str) -> None:
     existing = _load_json(PASSWORDS_FILE, {"version": VERSION, "entries": []})
     with open(path, "r") as f:
         new_data = json.load(f)
+    # Handle collisions explicitly via add_password (prompts user)
     for entry in new_data.get("entries", []):
-        add_password(entry["site"], entry["username"], entry["password"],
+        # Try to decrypt if incoming passwords are encrypted with current session;
+        # if not, pass through (add_password will re-encrypt if possible).
+        incoming_pw = entry.get("password", "")
+        if incoming_pw and incoming_pw.startswith("gAAAA"):
+            # assume encrypted; attempt decrypt (if wrong key, keep token)
+            maybe_plain = _maybe_decrypt(incoming_pw)
+            if maybe_plain not in ("[UNREADABLE]", ""):
+                incoming_pw = maybe_plain
+        add_password(entry.get("site",""), entry.get("username",""), incoming_pw,
                      entry.get("notes", ""), entry.get("tags", []))
     print("Import completed.")
 
 
-
+def _print_help():
+    print("Commands:")
+    print("  1=Add, 2=List, 3=Search, 4=Edit, 5=Delete, 6=Reveal, 7=Export, 8=Import, 9=Lock, help=Show this help, q=Quit")
 
 
 def main() -> None:
@@ -334,6 +489,7 @@ def main() -> None:
     with registration, login and menu functionality in future ships.
     """
     print("Welcome to the Password Manager!")
+    _verify_integrity_on_startup()
     
     while True:
         choice = input("Choose 1 for Registration or 2 for Login or q to Quit: ")
@@ -350,8 +506,8 @@ def main() -> None:
                 # Show a simple menu after successful login
                 while True:
                     user_input = input(
-                        "1=Add, 2=List, 3=Search, 4=Edit, 5=Delete, 6=Reveal, 7=Export, 8=Import, q=Quit: "
-                    )
+                        "1=Add, 2=List, 3=Search, 4=Edit, 5=Delete, 6=Reveal, 7=Export, 8=Import, 9=Lock, help=Help, q=Quit: "
+                    ).strip().lower()
                     if user_input == "1":
                         new_site = input("Site: ")
                         new_username = input("Username: ")
@@ -377,6 +533,14 @@ def main() -> None:
                         export_passwords("export.json")
                     elif user_input == "8":
                         import_passwords("export.json")
+                    elif user_input == "9":
+                        # lock: clear cipher and leave to login screen
+                        global FernetCipher
+                        FernetCipher = None
+                        print("Locked.")
+                        break
+                    elif user_input == "help":
+                        _print_help()
                     elif user_input == "q":
                         break
                     else:
